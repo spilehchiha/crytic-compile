@@ -1,37 +1,33 @@
 """
 CryticCompile main module. Handle the compilation.
 """
-import glob
 import inspect
-import json
-import logging
 import os
+import json
+import glob
+import logging
 import re
 import subprocess
+from typing import Dict, List, Union, Set, Tuple, Optional, Type, TYPE_CHECKING
 from pathlib import Path
-from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Type, Union
-
 import sha3
 
-from crytic_compile.platform import all_platforms, solc_standard_json
-from crytic_compile.platform.abstract_platform import AbstractPlatform
-from crytic_compile.platform.all_export import PLATFORMS_EXPORT
-from crytic_compile.platform.solc import Solc
-from crytic_compile.platform.standard import export_to_standard
-from crytic_compile.utils.naming import Filename
-from crytic_compile.utils.natspec import Natspec
-from crytic_compile.utils.npm import get_package_name
-from crytic_compile.utils.zip import load_from_zip
+from .platform import solc_standard_json, all_platforms
+from .platform.abstract_platform import AbstractPlatform
+from .platform.all_export import PLATFORMS_EXPORT
+from .platform.solc import Solc
+from .platform.standard import export_to_standard
+from .utils.naming import Filename
+from .utils.natspec import Natspec
+from .utils.zip import load_from_zip
+from .utils.npm import get_package_name
 
 # Cycle dependency
 if TYPE_CHECKING:
-    from crytic_compile.compiler.compiler import CompilerVersion
+    from .compiler.compiler import CompilerVersion
 
 LOGGER = logging.getLogger("CryticCompile")
 logging.basicConfig()
-
-
-# pylint: disable=too-many-lines
 
 
 def get_platforms() -> List[Type[AbstractPlatform]]:
@@ -56,7 +52,6 @@ def is_supported(target: str) -> bool:
     return any(platform.is_supported(target) for platform in platforms) or target.endswith(".zip")
 
 
-# pylint: disable=too-many-instance-attributes,too-many-public-methods
 class CryticCompile:
     """
     Main class.
@@ -64,10 +59,10 @@ class CryticCompile:
 
     def __init__(self, target: Union[str, AbstractPlatform], **kwargs: str):
         """
-        Args:
-            target (str|SolcStandardJson)
-        Keyword Args:
-            See https://github.com/crytic/crytic-compile/wiki/Configuration
+            Args:
+                target (str|SolcStandardJson)
+            Keyword Args:
+                See https://github.com/crytic/crytic-compile/wiki/Configuration
         """
         # ASTS are indexed by absolute path
         self._asts: Dict = {}
@@ -93,19 +88,6 @@ class CryticCompile:
         self._filenames: Set[Filename] = set()
         # mapping from contract name to filename (naming.Filename)
         self._contracts_filenames: Dict[str, Filename] = {}
-        # mapping from absolute/relative/used to filename
-        self._filenames_lookup: Optional[Dict[str, Filename]] = None
-
-        # Mapping each file to
-        #  offset -> line, column
-        # This is not memory optimized, but allow an offset lookup in O(1)
-        # Because we frequently do this lookup in Slither during the AST parsing
-        # We decided to favor the running time versus memory
-        self._cached_offset_to_line: Dict[Filename, Dict[int, Tuple[int, int]]] = dict()
-
-        # Return the line from the line number
-        # Note: line 1 is at index 0
-        self._cached_line_to_code: Dict[Filename, List[bytes]] = dict()
 
         # Libraries used by the contract
         # contract_name -> (library, pattern)
@@ -198,19 +180,19 @@ class CryticCompile:
     def filename_of_contract(self, name: str) -> Filename:
         """
         :return: utils.namings.Filename
-        """
+         """
         return self._contracts_filenames[name]
 
     def absolute_filename_of_contract(self, name: str) -> str:
         """
         :return: Absolute filename
-        """
+         """
         return self._contracts_filenames[name].absolute
 
     def used_filename_of_contract(self, name: str) -> str:
         """
         :return: Used filename
-        """
+         """
         return self._contracts_filenames[name].used
 
     def find_absolute_filename_from_used_filename(self, used_filename: str) -> str:
@@ -248,15 +230,14 @@ class CryticCompile:
         :param filename: str
         :return: crytic_compile.naming.Filename
         """
-        if self._filenames_lookup is None:
-            self._filenames_lookup = {}
-            for file in self._filenames:
-                self._filenames_lookup[file.absolute] = file
-                self._filenames_lookup[file.relative] = file
-                self._filenames_lookup[file.used] = file
-        if filename not in self._filenames_lookup:
-            raise ValueError(f"{filename} does not exist in {self._filenames_lookup}")
-        return self._filenames_lookup[filename]
+        d_file = {}
+        for file in self._filenames:
+            d_file[file.absolute] = file
+            d_file[file.relative] = file
+            d_file[file.used] = file
+        if filename not in d_file:
+            raise ValueError(f"{filename} does not exist in {d_file}")
+        return d_file[filename]
 
     @property
     def dependencies(self) -> Set[str]:
@@ -297,49 +278,6 @@ class CryticCompile:
     @working_dir.setter
     def working_dir(self, path: Path):
         self._working_dir = path
-
-    def _get_cached_offset_to_line(self, file: Filename):
-        if file not in self._cached_line_to_code:
-            self._get_cached_line_to_code(file)
-
-        source_code = self._cached_line_to_code[file]
-        acc = 0
-        lines_delimiters: Dict[int, Tuple[int, acc]] = dict()
-        for line_number, x in enumerate(source_code):
-            for i in range(acc, acc + len(x)):
-                lines_delimiters[i] = (line_number + 1, i - acc + 1)
-            acc += len(x)
-        lines_delimiters[acc] = (len(source_code) + 1, 0)
-        self._cached_offset_to_line[file] = lines_delimiters
-
-    def get_line_from_offset(self, filename: str, offset: int) -> Tuple[int, int]:
-        file = self.filename_lookup(filename)
-        if file not in self._cached_offset_to_line:
-            self._get_cached_offset_to_line(file)
-
-        lines_delimiters = self._cached_offset_to_line[file]
-        return lines_delimiters[offset]
-
-    def _get_cached_line_to_code(self, file: Filename):
-        source_code = self.src_content[file.absolute]
-        source_code_encoded = source_code.encode("utf-8")
-        source_code_list = source_code_encoded.splitlines(True)
-        self._cached_line_to_code[file] = source_code_list
-
-    def get_code_from_line(self, filename: str, line: int) -> Optional[bytes]:
-        """
-        Return the line from the file. Start at line = 1.
-        Return None if the line is not in the file
-
-        """
-        file = self.filename_lookup(filename)
-        if file not in self._cached_line_to_code:
-            self._get_cached_line_to_code(file)
-
-        lines = self._cached_line_to_code[file]
-        if line - 1 < 0 or line - 1 >= len(lines):
-            return None
-        return lines[line - 1]
 
     # endregion
     ###################################################################################
@@ -558,7 +496,8 @@ class CryticCompile:
         """
         # If we have no source code loaded yet, load it for every contract.
         if not self._src_content:
-            for filename in self.filenames:
+            for name in self.contracts_names:
+                filename = self.filename_of_contract(name)
                 if filename.absolute not in self._src_content and os.path.isfile(filename.absolute):
                     with open(filename.absolute, encoding="utf8", newline="") as source_file:
                         self._src_content[filename.absolute] = source_file.read()
@@ -711,7 +650,7 @@ class CryticCompile:
         return new_names
 
     def _library_name_lookup(
-        self, lib_name: str, original_contract: str
+            self, lib_name: str, original_contract: str
     ) -> Optional[Tuple[str, str]]:
         """
         Convert a library name to the contract
@@ -743,14 +682,14 @@ class CryticCompile:
 
             # Solidity 0.4 with filename
             solidity_0_4_filename = (
-                "__" + name_with_absolute_filename + "_" * (38 - len(name_with_absolute_filename))
+                    "__" + name_with_absolute_filename + "_" * (38 - len(name_with_absolute_filename))
             )
             if solidity_0_4_filename == lib_name:
                 return name, solidity_0_4_filename
 
             # Solidity 0.4 with filename
             solidity_0_4_filename = (
-                "__" + name_with_used_filename + "_" * (38 - len(name_with_used_filename))
+                    "__" + name_with_used_filename + "_" * (38 - len(name_with_used_filename))
             )
             if solidity_0_4_filename == lib_name:
                 return name, solidity_0_4_filename
@@ -824,7 +763,7 @@ class CryticCompile:
         return self._libraries[name]
 
     def _update_bytecode_with_libraries(
-        self, bytecode: str, libraries: Union[None, Dict[str, str]]
+            self, bytecode: str, libraries: Union[None, Dict[str, str]]
     ) -> str:
         """
         Patch the bytecode
@@ -942,7 +881,7 @@ class CryticCompile:
 
     def export(self, **kwargs: str) -> Optional[str]:
         """
-        Export to json. The json format can be crytic-compile, solc or truffle.
+            Export to json. The json format can be crytic-compile, solc or truffle.
         """
         export_format = kwargs.get("export_format", None)
         if export_format is None:
@@ -958,7 +897,6 @@ class CryticCompile:
     ###################################################################################
     ###################################################################################
 
-    # pylint: disable=no-self-use
     def _init_platform(self, target: str, **kwargs: str) -> AbstractPlatform:
         platforms = get_platforms()
         platform = None
@@ -966,8 +904,7 @@ class CryticCompile:
         compile_force_framework: Union[str, None] = kwargs.get("compile_force_framework", None)
         if compile_force_framework:
             platform = next(
-                (p(target) for p in platforms if p.NAME.lower() == compile_force_framework.lower()),
-                None,
+                (p(target) for p in platforms if p.NAME == compile_force_framework), None
             )
 
         if not platform:
@@ -1014,9 +951,9 @@ class CryticCompile:
 
     def _remove_metadata(self):
         """
-        Init bytecode contains metadata that needs to be removed
-        see
-        http://solidity.readthedocs.io/en/v0.4.24/metadata.html#encoding-of-the-metadata-hash-in-the-bytecode
+            Init bytecode contains metadata that needs to be removed
+            see
+            http://solidity.readthedocs.io/en/v0.4.24/metadata.html#encoding-of-the-metadata-hash-in-the-bytecode
         """
         self._init_bytecodes = {
             key: re.sub(r"a165627a7a72305820.{64}0029", r"", bytecode)
@@ -1076,7 +1013,11 @@ def compile_all(target: str, **kwargs: str) -> List[CryticCompile]:
             compilations.append(CryticCompile(target, **kwargs))
     elif os.path.isdir(target) or len(globbed_targets) > 0:
         # We create a new glob to find solidity files at this path (in case this is a directory)
-        filenames = glob.glob(os.path.join(target, "*.sol"))
+        filenames = glob.glob(os.path.join(target, "*.sol"), recursive = True)
+        filenames.append(glob.glob(os.path.join(target, "*.zip"), recursive=True))
+        flatten = lambda *l: (subelement for element in l for subelement in (flatten(*element) if isinstance(element, (list)) else (element,)))
+        filenames = list(flatten(filenames))
+        print(filenames)
         if not filenames:
             filenames = glob.glob(os.path.join(target, "*.vy"))
             if not filenames:
@@ -1089,12 +1030,18 @@ def compile_all(target: str, **kwargs: str) -> List[CryticCompile]:
             # input to create a single compilation with all files
             standard_json = solc_standard_json.SolcStandardJson()
             for filename in filenames:
-                standard_json.add_source_file(filename)
+                if (filename.endswith(".zip")):
+                    compilations.append(load_from_zip(filename))
+                else:
+                    standard_json.add_source_file(filename)
             compilations.append(CryticCompile(standard_json, **kwargs))
         else:
             # We compile each file and add it to our compilations.
             for filename in filenames:
-                compilations.append(CryticCompile(filename, **kwargs))
+                if (filename.endswith(".zip")):
+                    compilations.append(load_from_zip(filename))
+                else:
+                    compilations.append(CryticCompile(filename, **kwargs))
     else:
         raise ValueError(f"Unresolved target: {str(target)}")
 
